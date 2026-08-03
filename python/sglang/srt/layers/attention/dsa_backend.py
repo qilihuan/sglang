@@ -786,10 +786,55 @@ class DeepseekSparseAttnBackend(
         indexer_seq_lens = forward_batch.seq_lens
 
         if forward_batch.forward_mode.is_decode_or_idle():
-            extend_seq_lens_cpu = [1] * batch_size
-            max_seqlen_q = 1
-            cu_seqlens_q = self.get_device_int32_arange(batch_size + 1)
-            seqlens_expanded = cache_seqlens_int32
+            # A DP-idle rank (no real requests this round) can still be padded
+            # by DpPaddingMode.MAX_LEN to mirror an active sibling's
+            # TARGET_VERIFY/DRAFT_EXTEND_V2 round, i.e. `tokens_per_row` tokens
+            # per padded placeholder "request" instead of the usual 1 (see
+            # eagle_worker_common.py::prepare_for_draft_extend, which keeps
+            # forward_mode == IDLE for these ranks so other idle skip-logic
+            # still applies). AttentionBackend.forward() short-circuits real
+            # MLA attention for is_idle() batches, but the DSA indexer's
+            # topk/logits computation (dsa/dsa_indexer.py::_get_topk_paged)
+            # runs unconditionally before that short-circuit and reads
+            # page_table_1 per q row. Without this branch, page_table_1 stays
+            # at `batch_size` rows while q/logits carry `tokens_per_row *
+            # batch_size` padded rows, and the AITER paged-MQA-logits kernel
+            # reads block_tables out of bounds for the extra rows (observed as
+            # an async "Memory access fault ... Reason: Unknown").
+            tokens_per_row = 1
+            if forward_batch.forward_mode.is_idle() and batch_size > 0:
+                num_tokens_actual = forward_batch.input_ids.shape[0]
+                if (
+                    num_tokens_actual > batch_size
+                    and num_tokens_actual % batch_size == 0
+                ):
+                    tokens_per_row = num_tokens_actual // batch_size
+            if tokens_per_row > 1:
+                extend_seq_lens_cpu = [tokens_per_row] * batch_size
+                max_seqlen_q = 1
+                cu_seqlens_q = torch.arange(
+                    0,
+                    batch_size * tokens_per_row + 1,
+                    1,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                seqlens_expanded = seqlens_expand_triton(
+                    torch.tensor(
+                        extend_seq_lens_cpu, dtype=torch.int32, device=device
+                    ),
+                    cache_seqlens_int32,
+                    tokens_per_row * batch_size,
+                    tokens_per_row,
+                )
+                page_table = torch.repeat_interleave(
+                    page_table, repeats=tokens_per_row, dim=0
+                )
+            else:
+                extend_seq_lens_cpu = [1] * batch_size
+                max_seqlen_q = 1
+                cu_seqlens_q = self.get_device_int32_arange(batch_size + 1)
+                seqlens_expanded = cache_seqlens_int32
         elif forward_batch.forward_mode.is_target_verify():
             max_seqlen_q = 1
             cu_seqlens_q = torch.arange(
@@ -2155,7 +2200,55 @@ class DeepseekSparseAttnBackend(
         metadata = self.forward_metadata
         assert causal, "DSA is causal only"
 
+        # eagle_worker_v2.py's draft() plans this metadata once before the
+        # per-step loop, on the pre-DP-padding batch (it marks the batch
+        # ready without opting into forward_batch's generic post-pad
+        # re-plan, matching draft-extend's documented #27091 restriction on
+        # rebuilding DSA's deep_gemm schedule_meta after DP MLP-sync
+        # padding). If MAX_LEN padding then grows this call's actual
+        # q/topk_indices row count beyond that plan, do NOT try to re-plan
+        # metadata for the padded size here: sglang upstream hit the same
+        # class of bug for NSA (sgl-project/sglang#24233) and the accepted
+        # fix (#24235) is "attention should run only on the real, unpadded
+        # batch; DP padding rows are only needed for the later MLP sync
+        # path". Concretely: run the attention math on just the metadata's
+        # real (pre-pad) rows, then zero-pad the output back up to the full
+        # padded row count so callers see the shape they expect. This also
+        # sidesteps whatever aiter/indexer state assumes a stable batch
+        # size for the lifetime of one metadata object (see run_5_mtp_fix
+        # try_014: naively re-planning mid-flight produced a GPU memory
+        # fault instead of the plain shape assertion this replaces).
+        padded_bs = forward_batch.batch_size
+        real_bs = padded_bs
+        if (
+            forward_batch.forward_mode.is_decode_or_idle()
+            and metadata.page_table_1 is not None
+            and metadata.page_table_1.shape[0] < padded_bs
+        ):
+            real_bs = metadata.page_table_1.shape[0]
+
+        if real_bs < padded_bs:
+            q = q[:real_bs]
+            if q_rope is not None:
+                q_rope = q_rope[:real_bs]
+            if k is not None:
+                k = k[:real_bs]
+            if v is not None:
+                v = v[:real_bs]
+            if topk_indices is not None:
+                topk_indices = topk_indices[:real_bs]
+            out_cache_loc = forward_batch.out_cache_loc[:real_bs]
+            req_pool_indices = forward_batch.req_pool_indices[:real_bs]
+            seq_lens = forward_batch.seq_lens[:real_bs]
+        else:
+            out_cache_loc = forward_batch.out_cache_loc
+            req_pool_indices = forward_batch.req_pool_indices
+            seq_lens = forward_batch.seq_lens
+
         if self.dsa_decode_impl == "trtllm":
+            # Not exercised by the current recipe (dsa_decode_backend=aiter);
+            # left on the original forward_batch-driven path rather than
+            # wired through the real/padded split above.
             return self._forward_trtllm(
                 q,
                 k,
@@ -2176,7 +2269,7 @@ class DeepseekSparseAttnBackend(
             assert v is not None
             if save_kv_cache:
                 cache_loc = (
-                    forward_batch.out_cache_loc
+                    out_cache_loc
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
@@ -2211,8 +2304,8 @@ class DeepseekSparseAttnBackend(
 
         if self.hisparse_coordinator is not None:
             page_table_1 = self.hisparse_coordinator.swap_in_selected_pages(
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
+                req_pool_indices,
+                seq_lens,
                 topk_indices,
                 layer.layer_id,
             )
@@ -2228,7 +2321,7 @@ class DeepseekSparseAttnBackend(
         if self.dsa_decode_impl == "flashmla_sparse":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
-            return self._forward_flashmla_sparse(
+            o = self._forward_flashmla_sparse(
                 q_all=q_all,
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
@@ -2238,7 +2331,7 @@ class DeepseekSparseAttnBackend(
         elif self.dsa_decode_impl == "flashmla_kv":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
-            return self._forward_flashmla_kv(
+            o = self._forward_flashmla_kv(
                 q_all=q_all,
                 kv_cache=kv_cache,
                 sm_scale=layer.scaling,
@@ -2255,7 +2348,7 @@ class DeepseekSparseAttnBackend(
             # CUDA / MUSA paths byte-identical to pre-patch by always re-cat.
             if q_all is None or not _is_hip:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
-            return self._forward_tilelang(
+            o = self._forward_tilelang(
                 q_all=q_all,
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
@@ -2263,7 +2356,7 @@ class DeepseekSparseAttnBackend(
                 v_head_dim=layer.v_head_dim,
             )
         elif self.dsa_decode_impl == "fa3":
-            return self._forward_fa3(
+            o = self._forward_fa3(
                 q_rope=q_rope,
                 kv_cache=kv_cache,
                 v_head_dim=layer.v_head_dim,
@@ -2280,17 +2373,27 @@ class DeepseekSparseAttnBackend(
         elif self.dsa_decode_impl == "aiter":
             if q_all is None or not _is_hip:
                 q_all = torch.cat([q_nope, q_rope], dim=-1)
-            return self._forward_aiter(
+            o = self._forward_aiter(
                 q_all=q_all,
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
                 layer=layer,
                 metadata=metadata,
-                bs=forward_batch.batch_size,
+                bs=real_bs,
             )
 
         else:
             assert False, f"Unsupported {self.dsa_decode_impl = }"
+
+        if real_bs < padded_bs:
+            # Restore the padded row count the caller expects: DP-attention
+            # collectives beyond this point (dp_gather_replicate etc.) are
+            # matched by shape/call-order across ranks, not by which rows
+            # are "real" -- the zero rows for the padding tail are never
+            # read (they belong to requests this rank doesn't own).
+            pad_rows = padded_bs - real_bs
+            o = torch.cat([o, o.new_zeros(pad_rows, *o.shape[1:])], dim=0)
+        return o
 
     def _forward_fa3(
         self,

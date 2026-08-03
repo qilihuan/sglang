@@ -554,6 +554,20 @@ def eagle_prepare_for_verify(
             verify_forward_batch
         )
     )
+    global_counts = (
+        verify_forward_batch.original_global_num_tokens_cpu
+        or verify_forward_batch.global_num_tokens_cpu
+    )
+    if (
+        can_run_cuda_graph
+        and global_counts is not None
+        and min(global_counts) == 0
+        and max(global_counts) > 0
+    ):
+        # Keep a sparse-DP MTP round on one execution path. Otherwise an idle
+        # rank can replay this phase and submit its next phase before active
+        # ranks have reached the matching eager collective.
+        can_run_cuda_graph = False
     if can_run_cuda_graph:
         target_worker.model_runner.decode_cuda_graph_runner.load_batch(
             verify_forward_batch

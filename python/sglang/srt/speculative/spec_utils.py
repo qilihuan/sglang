@@ -294,8 +294,7 @@ def _select_top_k_tokens_first(
     return input_ids, hidden_states, topk_p, tree_info
 
 
-@torch.compile(dynamic=True, disable=_is_npu or _is_xpu)
-def _select_top_k_tokens_later(
+def _select_top_k_tokens_later_impl(
     i: int,
     topk_p: torch.Tensor,
     topk_index: torch.Tensor,
@@ -341,7 +340,27 @@ def select_top_k_tokens(
 ):
     if i == 0:
         return _select_top_k_tokens_first(topk_p, topk_index, hidden_states, topk)
-    return _select_top_k_tokens_later(
+    # NOTE: _select_top_k_tokens_later_impl intentionally is NOT wrapped in
+    # torch.compile. It used to be (`dynamic=True`), which works fine when
+    # every call happens through CUDA-graph capture/replay (capture only
+    # needs *some* kernel sequence to record, compiled or not) or through
+    # eager execution that was already warmed up ahead of time. But a
+    # sparse-DP MTP round (see _has_sparse_dp_batch in eagle_worker_v2.py)
+    # can force a DP rank off CUDA-graph replay onto a genuinely eager call
+    # of this function for the first time *during live serving*, and on
+    # this ROCm/Triton stack that has been observed (via py-spy, two
+    # independent trigger conditions: a size-0/1 specialization guard miss,
+    # and separately a GLOBAL_STATE grad_mode guard miss) to permanently
+    # hang inside the freshly generated kernel's Triton autotune benchmark
+    # (torch.cuda.synchronize() inside triton_heuristics.py's
+    # _make_launchers never returns). There is no reliable way to enumerate
+    # every guard condition that could trigger a fresh runtime compile
+    # here, so avoid the compiled path entirely: this op is a small
+    # tensor gather/topk over `topk` (<= a few) columns, not a hot GEMM,
+    # so eager overhead is negligible next to the rest of the forward
+    # pass, and CUDA-graph capture/replay for the common case is
+    # unaffected since it captures whatever kernels eager execution issues.
+    return _select_top_k_tokens_later_impl(
         i, topk_p, topk_index, hidden_states, scores, topk
     )
 

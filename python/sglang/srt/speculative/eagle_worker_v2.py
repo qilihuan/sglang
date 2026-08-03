@@ -93,6 +93,7 @@ from sglang.srt.utils.async_probe import (
 )
 from sglang.srt.utils.common import (
     MultiprocessingSerializer,
+    ceil_align,
     empty_context,
     fast_topk,
     get_available_gpu_memory,
@@ -115,6 +116,116 @@ _is_xpu = is_xpu()
 
 
 logger = logging.getLogger(__name__)
+
+
+def _slice_draft_output_to_local_tokens(
+    next_token_logits: torch.Tensor,
+    hidden_states: Optional[torch.Tensor],
+    positions: torch.Tensor,
+    num_local_tokens: int,
+) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+    """Discard DP-attention padding rows before eager draft postprocessing."""
+    for name, tensor in (
+        ("next_token_logits", next_token_logits),
+        ("hidden_states", hidden_states),
+        ("positions", positions),
+    ):
+        if tensor is not None and tensor.shape[0] < num_local_tokens:
+            raise RuntimeError(
+                f"EAGLE draft {name} has {tensor.shape[0]} rows, "
+                f"but {num_local_tokens} local tokens need postprocessing"
+            )
+
+    return (
+        next_token_logits[:num_local_tokens],
+        hidden_states[:num_local_tokens] if hidden_states is not None else None,
+        positions[:num_local_tokens],
+    )
+
+
+def _sync_can_cuda_graph_across_dp(can_cuda_graph: bool, device) -> bool:
+    """Force every DP-attention rank to make the identical graph/eager choice.
+
+    ``can_cuda_graph`` up to this point is computed purely from *local*
+    per-rank state: this rank's batch shape, whether its cuda-graph-runner
+    happens to support replay for this exact batch, cached indexer state
+    like ``dsa_topk_indices`` (which can be ``None`` only on a rank that was
+    idle last round and therefore didn't get to seed it), the sparse-DP
+    guard, etc. These conditions are numerous and not fully enumerable --
+    empirically (see run_5_mtp_fix/try_011) even the sparse-DP guard alone
+    is insufficient because a rank freshly back from being idle can also be
+    forced onto the eager path here for reasons unrelated to sparsity.
+    DP-attention's per-layer collectives are matched across ranks strictly
+    by call order, and CUDA graph replay issues a totally different
+    sequence/timing of ops than the eager Python loop for the exact same
+    nominal phase. When ranks disagree on which path to take, this doesn't
+    just risk a shape mismatch -- it has been observed to deadlock as a
+    genuine GPU-stream-level hang (all ranks blocked at the same
+    `.item()`/D2H sync inside attention metadata prep, watchdog kill,
+    try_011/decode.log). Rather than continuing to chase individual causes
+    of disagreement one at a time, unify the decision with a single cheap
+    all-reduce (SUM of a 0/1 flag) over the group spanning all DP-attention
+    ranks: only take the CUDA graph path if *every* rank locally agreed to.
+    """
+    parallel = get_parallel()
+    if parallel.attn_dp_size <= 1:
+        return can_cuda_graph
+    flag = torch.tensor(
+        [1 if can_cuda_graph else 0], dtype=torch.int32, device=device
+    )
+    parallel.tp_group.all_reduce(flag)
+    return bool(flag.item() == parallel.attn_dp_size)
+
+
+def _expected_dp_padded_num_tokens(forward_batch: ForwardBatch) -> int:
+    """Predict the token count ``ForwardBatch.prepare_mlp_sync_batch`` will
+    pad this batch to, called *before* that padding actually runs.
+
+    ``_draft_extend_for_decode`` must size its eager DSA top-k seed buffer
+    (``dsa_seed_topk_capture``) before calling ``self.draft_runner.forward``,
+    but that call is what triggers the real DP MLP-sync padding (see
+    ``model_runner.py::_prepare_eager_forward_batch``). Sizing the buffer
+    from the *pre-pad* ``forward_batch.input_ids.shape[0]`` under-allocates
+    it whenever this round's ``DpPaddingMode.MAX_LEN`` target (driven by
+    other DP ranks' token counts) exceeds this rank's own real token count --
+    the indexer then writes past the buffer's real capacity for the padded
+    rows, corrupting adjacent GPU memory (see run_5_mtp_fix/try_013,
+    try_014). Mirror prepare_mlp_sync_batch's MAX_LEN computation here so the
+    buffer is sized for the call that will actually run against it; keep
+    this in sync with that function. SUM_LEN mode pads each rank to
+    (approximately) its own token count, so the pre-pad size already used by
+    callers remains correct there and this returns None to signal "no
+    change needed".
+    """
+    counts = forward_batch.global_num_tokens_cpu
+    if not counts:
+        return None
+    from sglang.srt.layers.cp.padding import get_cp_padding_align_size
+    from sglang.srt.layers.cp.utils import enable_cp_v2
+    from sglang.srt.layers.dp_attention import DpPaddingMode
+
+    attn_tp_size = get_parallel().attn_tp_size
+    aligned = [ceil_align(c, attn_tp_size) for c in counts]
+    if not enable_cp_v2():
+        cp_align_size = get_cp_padding_align_size()
+        aligned = [ceil_align(c, cp_align_size) for c in aligned]
+    dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
+        forward_batch.is_extend_in_batch, aligned
+    )
+    if not dp_padding_mode.is_max_len():
+        return None
+    return max(aligned)
+
+
+def _has_sparse_dp_batch(forward_batch: ForwardBatch) -> bool:
+    """True when an MTP forward contains both active and idle DP ranks."""
+    # `global_num_tokens_cpu` is rewritten to equal MAX_LEN values by
+    # `prepare_mlp_sync_batch`; the original values retain idle-rank zeros.
+    counts = (
+        forward_batch.original_global_num_tokens_cpu
+        or forward_batch.global_num_tokens_cpu
+    )
+    return counts is not None and min(counts) == 0 and max(counts) > 0
 
 
 class EagleDraftWorker(EagleDraftWorkerBase):
@@ -515,6 +626,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             and draft_input.dsa_topk_indices is None
         ):
             can_cuda_graph = False
+        if can_cuda_graph and _has_sparse_dp_batch(forward_batch):
+            # See the matching draft-extend guard: a sparse DP MTP round must
+            # not mix graph replay on idle ranks with eager active-rank work.
+            can_cuda_graph = False
+        can_cuda_graph = _sync_can_cuda_graph_across_dp(can_cuda_graph, self.device)
 
         n_inner = self.speculative_num_steps - 1
         canary_outside_ctx = (
@@ -533,6 +649,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     self.cuda_graph_runner.execute(forward_batch)
                 )
             else:
+                # NOTE: an idle batch must still run this exact eager
+                # draft_forward loop (same number of steps / model forward
+                # calls as an active batch) rather than being skipped, even
+                # though its result is discarded by build_eagle_verify_input
+                # below. DP-attention's per-layer collectives
+                # (dp_gather_replicate) are matched across ranks by call
+                # order/count, not by logical phase, so an idle rank that
+                # skips these forward calls races ahead into the next
+                # phase's collectives while active ranks are still finishing
+                # this phase's, producing the same class of cross-rank
+                # collective mismatch this guard exists to prevent. The
+                # size-0 tensors this idle path produces are handled inside
+                # select_top_k_tokens() (see spec_utils.py) instead, so they
+                # never reach torch.compile.
                 if (
                     not forward_batch.forward_mode.is_idle()
                     and self.speculative_num_steps > 1
@@ -636,6 +766,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 break
 
             # Set inputs
+            num_local_tokens = input_ids.shape[0]
             forward_batch.input_ids = input_ids
             # Qwen3-MoE MTP uses a fused RoPE + KV-store path whose cache_loc
             # argument must be contiguous.
@@ -664,47 +795,55 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 canary_index_ctx,
             ):
                 logits_output = self.draft_runner.forward(forward_batch).logits_output
-            maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
-            maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
+            next_token_logits, next_hidden_states, local_positions = (
+                _slice_draft_output_to_local_tokens(
+                    logits_output.next_token_logits,
+                    logits_output.hidden_states,
+                    forward_batch.positions,
+                    num_local_tokens,
+                )
+            )
+            maybe_detect_nan(next_token_logits, f"draft_forward step {i}")
+            maybe_detect_inf(next_token_logits, f"draft_forward step {i}")
             if self.server_args.speculative_use_rejection_sampling:
                 probs, topk_p, topk_index = sample_draft_proposal(
-                    logits_output.next_token_logits,
+                    next_token_logits,
                     forward_batch.sampling_info.temperatures,
                 )
                 draft_probs_list.append(probs)
-                forward_batch.positions.add_(1)
+                local_positions.add_(1)
             elif self.topk == 1 and not _is_hip:
                 if _is_cuda:
                     # The positions advance is fused into the kernel.
                     topk_p, topk_index = draft_topk1_postprocess(
-                        logits_output.next_token_logits,
-                        forward_batch.positions,
+                        next_token_logits,
+                        local_positions,
                         draft_tokens_topk1,
                         i + 1,
                     )
                 else:
                     topk_index = torch.argmax(
-                        logits_output.next_token_logits, dim=-1, keepdim=True
+                        next_token_logits, dim=-1, keepdim=True
                     )
                     topk_p = torch.ones_like(topk_index, dtype=torch.float32)
-                    forward_batch.positions.add_(1)
+                    local_positions.add_(1)
             else:
                 probs = renorm_draft_probs(
-                    logits_output.next_token_logits,
+                    next_token_logits,
                     forward_batch.sampling_info,
                     self.server_args.speculative_use_rejection_sampling,
                 )
                 topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
-                forward_batch.positions.add_(1)
+                local_positions.add_(1)
             maybe_detect_oob(
                 topk_index,
                 0,
-                logits_output.next_token_logits.shape[-1],
-                f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
+                next_token_logits.shape[-1],
+                f"draft_forward step {i}: topk_index OOB vs vocab_size={next_token_logits.shape[-1]}",
             )
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
-            hidden_states = logits_output.hidden_states
+            hidden_states = next_hidden_states
 
         if self.index_share_for_mtp_iteration:
             spec_info.dsa_topk_indices = None
@@ -917,12 +1056,26 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.cuda_graph_runner_for_draft_extend
             and self.cuda_graph_runner_for_draft_extend.can_run_graph(forward_batch)
         )
+        if can_cuda_graph and _has_sparse_dp_batch(forward_batch):
+            # Graph replay can let an idle DP rank advance to the next MTP
+            # phase before active ranks have submitted this phase's eager
+            # collective. Keep every rank on the same eager path instead.
+            can_cuda_graph = False
+        can_cuda_graph = _sync_can_cuda_graph_across_dp(can_cuda_graph, self.device)
 
         # Eager path publishes the indexer top-k into a worker buffer (the graph
         # path uses the runner's static buffer). Gathered at select_index below.
         if self.seed_dsa_topk_from_draft_extend and not can_cuda_graph:
+            # Size for the DP-MLP-sync-padded call about to run, not the
+            # pre-pad shape seen here -- see _expected_dp_padded_num_tokens.
+            padded_num_tokens = _expected_dp_padded_num_tokens(forward_batch)
+            buf_num_tokens = (
+                max(padded_num_tokens, forward_batch.input_ids.shape[0])
+                if padded_num_tokens is not None
+                else forward_batch.input_ids.shape[0]
+            )
             forward_batch.spec_info.dsa_seed_topk_capture = (
-                self._get_dsa_extend_topk_buf(forward_batch.input_ids.shape[0])
+                self._get_dsa_extend_topk_buf(buf_num_tokens)
             )
 
         canary_ctx = (

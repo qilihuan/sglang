@@ -909,7 +909,14 @@ class Indexer(MultiPlatformOp):
         if (
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
+            or forward_batch.forward_mode.is_idle()
         ):
+            # IDLE placeholder batches padded to mirror an active sibling's
+            # multi-token-per-row TARGET_VERIFY/DRAFT_EXTEND_V2 round need the
+            # same per-row expanded seqlens as those modes (see the matching
+            # comment in dsa_backend.py::init_forward_metadata); for a plain
+            # single-token IDLE round this is numerically identical to
+            # get_seqlens_int32(), so the switch is a no-op there.
             seqlens_32 = metadata.get_seqlens_expanded()
         else:
             seqlens_32 = metadata.get_seqlens_int32()
@@ -917,6 +924,7 @@ class Indexer(MultiPlatformOp):
         # otherwise fall back to computing it here.
         schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
         assert len(q_fp8.shape) == 3
+        physical_q_rows = q_fp8.shape[0]
         # attn_tp_size > 1 or MAX_LEN padding mode can leave padding in the
         # hidden states; q_offset is the real (unpadded) q length.
         q_offset = sum(metadata.get_dsa_extend_len_cpu())
@@ -974,7 +982,28 @@ class Indexer(MultiPlatformOp):
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
 
-        if self.paged_mqa_logits_backend.is_aiter():
+        use_aiter_paged_mqa = self.paged_mqa_logits_backend.is_aiter()
+        if use_aiter_paged_mqa:
+            if q_offset > physical_q_rows:
+                raise RuntimeError(
+                    f"AITER paged-MQA has {physical_q_rows} physical q rows, "
+                    f"but metadata requires {q_offset} real rows"
+                )
+            if block_tables.shape[0] != q_offset:
+                raise RuntimeError(
+                    f"AITER paged-MQA block table has {block_tables.shape[0]} rows, "
+                    f"but metadata requires {q_offset} real rows"
+                )
+
+            # MAX_LEN DP padding happens after attention metadata is planned.
+            # AITER derives its batch size directly from q_fp8.shape[0], so
+            # feeding the physical padded rows with the real-row block table
+            # makes the kernel index beyond metadata. Run attention on real
+            # rows only; top-k is padded back below for downstream DP/MLP sync.
+            q_fp8 = q_fp8[:q_offset]
+            weights = weights[:q_offset]
+            seqlens_32 = seqlens_32[:q_offset]
+
             logits = aiter_paged_mqa_logits(
                 q_fp8,
                 kv_cache_fp8,
@@ -1033,10 +1062,17 @@ class Indexer(MultiPlatformOp):
 
         # NOTE(dark): logits should be cleaned in topk_transform
         self._mask_init_and_local_tokens(logits, seqlens_32)
-        topk_result = metadata.topk_transform(logits, self.index_topk)
+        if use_aiter_paged_mqa and q_offset < physical_q_rows:
+            topk_result = metadata.topk_transform(
+                logits, self.index_topk, ke_offset=seqlens_32
+            )
+        else:
+            topk_result = metadata.topk_transform(logits, self.index_topk)
         # Restore possible padding exist in the hidden states.
-        if not _is_hip and q_offset < q_fp8.shape[0]:
-            pad_len = q_fp8.shape[0] - q_offset
+        if q_offset < physical_q_rows and (
+            not _is_hip or use_aiter_paged_mqa
+        ):
+            pad_len = physical_q_rows - q_offset
             padding = torch.full(
                 (pad_len, topk_result.shape[1]),
                 -1,
@@ -1744,6 +1780,40 @@ class Indexer(MultiPlatformOp):
         # When upstream uses fused FP8 RMSNorm+quant, activations may be passed as
         # a tuple like (x_fp8, x_scale[, y]). Use `x_meta` for shape/device queries.
         x_meta = x[0] if isinstance(x, tuple) else x
+
+        # A DP-attention idle rank can be physically padded with dummy tokens
+        # (and even a dummy multi-token-per-row shape mimicking an active
+        # sibling's TARGET_VERIFY/DRAFT_EXTEND_V2 round) purely so it can join
+        # the eager MLP/EP collectives of active ranks. It has no real request
+        # rows, so its DSA page table and DP-padding-derived seqlens metadata
+        # (dsa_backend.py's cal_padded_tokens/pad_dsa_cache_seqlens, which key
+        # off forward_batch.global_num_tokens_cpu) are not meaningful for it
+        # and can disagree in shape with the padded q/logits tensors -- this
+        # was observed both as an AITER paged-MQA-logits OOB read
+        # (block_tables indexed past its real row count) and as a
+        # `fast_topk_v2` `lengths.size(0) == B` assertion. Skip indexing
+        # entirely for eager idle rounds and return an all-invalid topk
+        # result instead; CUDA graphs already capture graph-shaped idle
+        # metadata, so that path is unaffected. Upstream reference: sglang PR
+        # #32209 (CUDA-only there; extended to HIP/AITER here for the same
+        # bug class).
+        if (
+            (_is_cuda or _is_hip)
+            and forward_batch.forward_mode.is_idle()
+            and not get_is_capture_mode()
+        ):
+            topk_result = (
+                torch.full(
+                    (x_meta.shape[0], self.index_topk),
+                    -1,
+                    dtype=torch.int32,
+                    device=x_meta.device,
+                )
+                if return_indices
+                else None
+            )
+            topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
+            return maybe_capture_indexer_topk(layer_id, topk_result)
 
         in_piecewise_or_breakable_cuda_graph = (
             _is_in_piecewise_or_breakable_cuda_graph()
