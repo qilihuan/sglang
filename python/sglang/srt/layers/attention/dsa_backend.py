@@ -153,6 +153,7 @@ else:
 
 
 _DSA_A8W8 = get_bool_env_var("SGLANG_DSA_A8W8")
+_DSA_MLA_METADATA_DEBUG = get_bool_env_var("SGLANG_DSA_MLA_METADATA_DEBUG")
 
 
 def _dsa_a8w8_ok(max_seqlen_q) -> bool:
@@ -268,6 +269,41 @@ class DSAFlashMLAMetadata:
         self.num_splits.copy_(other.num_splits)
 
 
+@dataclass
+class AiterMlaPersistentPool:
+    mode: Literal["decode", "extend", "spec"]
+    max_rows: int
+    work_meta_data: torch.Tensor
+    work_indptr: torch.Tensor
+    work_info_set: torch.Tensor
+    reduce_indptr: torch.Tensor
+    reduce_final_map: torch.Tensor
+    reduce_partial_map: torch.Tensor
+    kv_indptr: torch.Tensor
+    kv_last_page_lens: torch.Tensor
+    previous_metadata_key: Optional[Tuple] = None
+    build_count: int = 0
+
+
+@dataclass(frozen=True)
+class AiterMlaPersistentMetadata:
+    mode: Literal["decode", "extend", "spec"]
+    num_rows: int
+    max_seqlen_q: int
+    pool: AiterMlaPersistentPool
+
+    def kernel_kwargs(self) -> Dict:
+        return {
+            "work_meta_data": self.pool.work_meta_data,
+            "work_indptr": self.pool.work_indptr,
+            "work_info_set": self.pool.work_info_set,
+            "reduce_indptr": self.pool.reduce_indptr,
+            "reduce_final_map": self.pool.reduce_final_map,
+            "reduce_partial_map": self.pool.reduce_partial_map,
+            "num_kv_splits": 16,
+        }
+
+
 @dataclass(frozen=True)
 class DSAMetadata:
     page_size: int
@@ -302,6 +338,10 @@ class DSAMetadata:
     dsa_extend_seq_lens_list: List[int]
     dsa_seqlens_expanded: torch.Tensor  # expanded, unclipped `seqlens`
     dsa_max_seqlen_q: Literal[1] = 1  # always 1 for decode, variable for extend
+    # Number of real DSA query rows before CP/DP padding.
+    dsa_real_num_rows: int = 0
+    # AITER persistent schedule built once with the batch metadata.
+    aiter_mla_persistent: Optional[AiterMlaPersistentMetadata] = None
 
     flashmla_metadata: Optional[DSAFlashMLAMetadata] = None
     # DeepGEMM schedule metadata for paged MQA logits (decode/target_verify/draft_extend only).
@@ -628,13 +668,38 @@ class DeepseekSparseAttnBackend(
 
     def _init_aiter_mla_persistent_buffers(self, model_runner: ModelRunner) -> None:
         self._aiter_mla_persistent_ready = False
+        self._aiter_mla_persistent_pools: Dict[
+            str, AiterMlaPersistentPool
+        ] = {}
         if not (_is_hip and _DSA_A8W8 and self.kv_cache_dtype == torch.float8_e4m3fn):
             return
         max_bs = model_runner.req_to_token_pool.size
-        max_seqlen_qo = max(
-            2,
-            model_runner.server_args.speculative_num_draft_tokens or 1,
+        chunked_prefill_size = (
+            model_runner.server_args.chunked_prefill_size or max_bs
         )
+        spec_tokens = model_runner.server_args.speculative_num_draft_tokens or 1
+        pool_rows = {
+            "decode": max_bs,
+            "extend": max(max_bs, chunked_prefill_size),
+            "spec": max_bs * spec_tokens,
+        }
+
+        for mode, max_rows in pool_rows.items():
+            self._aiter_mla_persistent_pools[mode] = (
+                self._allocate_aiter_mla_persistent_pool(
+                    mode=mode,
+                    max_rows=max_rows,
+                    device=model_runner.device,
+                )
+            )
+        self._aiter_mla_persistent_ready = True
+
+    def _allocate_aiter_mla_persistent_pool(
+        self,
+        mode: Literal["decode", "extend", "spec"],
+        max_rows: int,
+        device: torch.device,
+    ) -> AiterMlaPersistentPool:
         nhead = self._mla_persistent_num_heads()
         (
             (work_meta_data_size, work_meta_data_type),
@@ -644,78 +709,177 @@ class DeepseekSparseAttnBackend(
             (reduce_final_map_size, reduce_final_map_type),
             (reduce_partial_map_size, reduce_partial_map_type),
         ) = get_mla_metadata_info_v1(
-            max_bs,
-            max_seqlen_qo,
+            max_rows,
+            1,
             nhead,
             fp8_dtype,
             fp8_dtype,
             is_sparse=True,
             fast_mode=True,
-        )
-        device = model_runner.device
-        self._aiter_mla_work_meta_data = torch.empty(
-            work_meta_data_size, dtype=work_meta_data_type, device=device
-        )
-        self._aiter_mla_work_indptr = torch.empty(
-            work_indptr_size, dtype=work_indptr_type, device=device
-        )
-        self._aiter_mla_work_info_set = torch.empty(
-            work_info_set_size, dtype=work_info_set_type, device=device
-        )
-        self._aiter_mla_reduce_indptr = torch.empty(
-            reduce_indptr_size, dtype=reduce_indptr_type, device=device
-        )
-        self._aiter_mla_reduce_final_map = torch.empty(
-            reduce_final_map_size, dtype=reduce_final_map_type, device=device
-        )
-        self._aiter_mla_reduce_partial_map = torch.empty(
-            reduce_partial_map_size, dtype=reduce_partial_map_type, device=device
-        )
-        self._aiter_sparse_kv_last_page_lens = torch.ones(
-            max_bs, dtype=torch.int32, device=device
-        )
-        self._aiter_mla_persistent_ready = True
-
-    def _refresh_aiter_mla_persistent_metadata(
-        self,
-        cu_seqlens_q: torch.Tensor,
-        kv_indptr: torch.Tensor,
-        kv_last_page_lens: torch.Tensor,
-        max_seqlen_q: int,
-    ) -> None:
-        get_mla_metadata_v1(
-            cu_seqlens_q,
-            kv_indptr,
-            kv_last_page_lens,
-            self._mla_persistent_num_heads(),
-            1,
-            True,
-            self._aiter_mla_work_meta_data,
-            self._aiter_mla_work_info_set,
-            self._aiter_mla_work_indptr,
-            self._aiter_mla_reduce_indptr,
-            self._aiter_mla_reduce_final_map,
-            self._aiter_mla_reduce_partial_map,
-            page_size=1,
-            dtype_q=fp8_dtype,
-            dtype_kv=fp8_dtype,
-            kv_granularity=16,
-            max_seqlen_qo=max_seqlen_q,
-            uni_seqlen_qo=max_seqlen_q,
-            fast_mode=True,
             max_split_per_batch=16,
         )
+        return AiterMlaPersistentPool(
+            mode=mode,
+            max_rows=max_rows,
+            work_meta_data=torch.empty(
+                work_meta_data_size, dtype=work_meta_data_type, device=device
+            ),
+            work_indptr=torch.empty(
+                work_indptr_size, dtype=work_indptr_type, device=device
+            ),
+            work_info_set=torch.empty(
+                work_info_set_size, dtype=work_info_set_type, device=device
+            ),
+            reduce_indptr=torch.empty(
+                reduce_indptr_size, dtype=reduce_indptr_type, device=device
+            ),
+            reduce_final_map=torch.empty(
+                reduce_final_map_size, dtype=reduce_final_map_type, device=device
+            ),
+            reduce_partial_map=torch.empty(
+                reduce_partial_map_size,
+                dtype=reduce_partial_map_type,
+                device=device,
+            ),
+            kv_indptr=torch.zeros(max_rows + 1, dtype=torch.int32, device=device),
+            kv_last_page_lens=torch.ones(
+                max_rows, dtype=torch.int32, device=device
+            ),
+        )
 
-    def _aiter_mla_persistent_kwargs(self) -> Dict:
-        return {
-            "work_meta_data": self._aiter_mla_work_meta_data,
-            "work_indptr": self._aiter_mla_work_indptr,
-            "work_info_set": self._aiter_mla_work_info_set,
-            "reduce_indptr": self._aiter_mla_reduce_indptr,
-            "reduce_final_map": self._aiter_mla_reduce_final_map,
-            "reduce_partial_map": self._aiter_mla_reduce_partial_map,
-            "num_kv_splits": 16,
-        }
+    def _build_aiter_mla_persistent_metadata(
+        self,
+        metadata: DSAMetadata,
+        mode: Literal["decode", "extend", "spec"],
+        metadata_key: Optional[Tuple] = None,
+    ) -> Optional[AiterMlaPersistentMetadata]:
+        if not self._use_aiter_mla_persistent(1):
+            return None
+        if mode == "extend" and self.dsa_prefill_impl != "aiter":
+            return None
+        pool = self._aiter_mla_persistent_pools.get(mode)
+        num_rows = metadata.dsa_real_num_rows
+        if pool is None or num_rows <= 0 or num_rows > pool.max_rows:
+            return None
+
+        dsa_lens = metadata.dsa_cache_seqlens_int32[:num_rows]
+        if metadata_key is None or metadata_key != pool.previous_metadata_key:
+            pool.kv_indptr[0] = 0
+            torch.cumsum(
+                dsa_lens,
+                dim=0,
+                dtype=torch.int32,
+                out=pool.kv_indptr[1 : num_rows + 1],
+            )
+            cu_seqlens_q = self.get_device_int32_arange(num_rows + 1)
+            kv_indptr = pool.kv_indptr[: num_rows + 1]
+            kv_last_page_lens = pool.kv_last_page_lens[:num_rows]
+            get_mla_metadata_v1(
+                cu_seqlens_q,
+                kv_indptr,
+                kv_last_page_lens,
+                self._mla_persistent_num_heads(),
+                1,
+                True,
+                pool.work_meta_data,
+                pool.work_info_set,
+                pool.work_indptr,
+                pool.reduce_indptr,
+                pool.reduce_final_map,
+                pool.reduce_partial_map,
+                page_size=1,
+                dtype_q=fp8_dtype,
+                dtype_kv=fp8_dtype,
+                kv_granularity=16,
+                max_seqlen_qo=1,
+                uni_seqlen_qo=1,
+                fast_mode=True,
+                max_split_per_batch=16,
+            )
+            pool.previous_metadata_key = metadata_key
+            pool.build_count += 1
+            if _DSA_MLA_METADATA_DEBUG:
+                print(
+                    f"[dsa][mla_metadata] mode={mode} build={pool.build_count} "
+                    f"rows={num_rows} max_seqlen_q=1",
+                    flush=True,
+                )
+        elif _DSA_MLA_METADATA_DEBUG:
+            print(
+                f"[dsa][mla_metadata] mode={mode} reuse rows={num_rows} "
+                "max_seqlen_q=1",
+                flush=True,
+            )
+
+        return AiterMlaPersistentMetadata(
+            mode=mode,
+            num_rows=num_rows,
+            max_seqlen_q=1,
+            pool=pool,
+        )
+
+    def _decode_aiter_mla_metadata_key(
+        self,
+        seq_lens_cpu: Optional[torch.Tensor],
+        num_rows: int,
+    ) -> Optional[Tuple]:
+        if seq_lens_cpu is None or num_rows <= 0 or len(seq_lens_cpu) < num_rows:
+            return None
+        if seq_lens_cpu.device.type != "cpu":
+            return None
+        clamped = torch.clamp(
+            seq_lens_cpu[:num_rows].to(torch.int32),
+            max=self.dsa_index_topk,
+        )
+        return (
+            num_rows,
+            self._mla_persistent_num_heads(),
+            clamped.numpy().tobytes(),
+        )
+
+    def _get_real_dsa_num_rows(
+        self,
+        forward_batch: ForwardBatch,
+        computed_rows: int,
+    ) -> int:
+        real_tokens = getattr(forward_batch, "num_token_non_padded_cpu", None)
+        if real_tokens is None:
+            num_padding = getattr(forward_batch, "num_padding", None)
+            if num_padding is not None:
+                real_reqs = max(
+                    int(forward_batch.batch_size) - int(num_padding),
+                    0,
+                )
+                if (
+                    forward_batch.forward_mode.is_target_verify()
+                    or forward_batch.forward_mode.is_draft_extend_v2()
+                ):
+                    real_tokens = real_reqs * self.speculative_num_draft_tokens
+                else:
+                    real_tokens = real_reqs
+        if real_tokens is None:
+            counts = (
+                getattr(forward_batch, "original_global_num_tokens_cpu", None)
+                or getattr(forward_batch, "global_num_tokens_cpu", None)
+            )
+            if counts:
+                dp_rank = get_parallel().attn_dp_rank
+                real_tokens = counts[dp_rank] if len(counts) > 1 else counts[0]
+        if real_tokens is None:
+            return computed_rows
+        # Context-parallel extend may already have split the local Q rows.
+        return min(computed_rows, int(real_tokens))
+
+    def _attach_aiter_mla_persistent_metadata(
+        self,
+        metadata: DSAMetadata,
+        mode: Literal["decode", "extend", "spec"],
+        metadata_key: Optional[Tuple] = None,
+    ) -> None:
+        persistent = self._build_aiter_mla_persistent_metadata(
+            metadata, mode, metadata_key
+        )
+        object.__setattr__(metadata, "aiter_mla_persistent", persistent)
 
     def _build_paged_mqa_schedule_2d_ctx_lens(
         self,
@@ -1119,6 +1283,10 @@ class DeepseekSparseAttnBackend(
             original_seq_lens=seqlens_expanded,
             dsa_index_topk=self.dsa_index_topk,
         )
+        dsa_real_num_rows = self._get_real_dsa_num_rows(
+            forward_batch,
+            int(dsa_cache_seqlens_int32.shape[0]),
+        )
         dsa_cache_seqlens_int32 = pad_dsa_cache_seqlens(
             forward_batch, dsa_cache_seqlens_int32
         )
@@ -1192,6 +1360,7 @@ class DeepseekSparseAttnBackend(
             dsa_cu_seqlens_k=dsa_cu_seqlens_k,
             dsa_seqlens_expanded=seqlens_expanded,
             dsa_extend_seq_lens_list=extend_seq_lens_cpu,
+            dsa_real_num_rows=dsa_real_num_rows,
             real_page_table=self._transform_table_1_to_real(page_table),
             dsa_max_seqlen_q=1,
             topk_indices_offset=topk_indices_offset,
@@ -1200,6 +1369,26 @@ class DeepseekSparseAttnBackend(
             indexer_seq_lens=indexer_seq_lens,
             token_to_batch_idx=token_to_batch_idx,
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
+        )
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            persistent_mode = "spec"
+            persistent_key = None
+        elif forward_batch.forward_mode.is_extend():
+            persistent_mode = "extend"
+            persistent_key = None
+        else:
+            persistent_mode = "decode"
+            persistent_key = self._decode_aiter_mla_metadata_key(
+                forward_batch.seq_lens_cpu,
+                dsa_real_num_rows,
+            )
+        self._attach_aiter_mla_persistent_metadata(
+            metadata,
+            persistent_mode,
+            persistent_key,
         )
         self.forward_metadata = metadata
 
@@ -1540,7 +1729,22 @@ class DeepseekSparseAttnBackend(
             dsa_seqlens_expanded=seqlens_expanded,
             real_page_table=real_page_table,
             dsa_extend_seq_lens_list=dsa_extend_seq_lens_list,
+            dsa_real_num_rows=real_rows,
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
+        )
+        if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
+            persistent_mode = "spec"
+            persistent_key = None
+        else:
+            persistent_mode = "decode"
+            persistent_key = self._decode_aiter_mla_metadata_key(
+                seq_lens_cpu,
+                real_rows,
+            )
+        self._attach_aiter_mla_persistent_metadata(
+            metadata,
+            persistent_mode,
+            persistent_key,
         )
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_metadata = metadata
@@ -1583,6 +1787,19 @@ class DeepseekSparseAttnBackend(
 
         # Normal Decode
         metadata: DSAMetadata = self.decode_cuda_graph_metadata[bs]
+        expected_rows = (
+            bs * self.speculative_num_draft_tokens
+            if (
+                forward_mode.is_target_verify()
+                or forward_mode.is_draft_extend_v2()
+            )
+            else bs
+        )
+        object.__setattr__(
+            metadata,
+            "dsa_real_num_rows",
+            expected_rows,
+        )
         used_fused_metadata_generation = False
         target_verify_ctx_lens_written = False
         if forward_mode.is_decode_or_idle():
@@ -1849,6 +2066,20 @@ class DeepseekSparseAttnBackend(
                 )
             )
 
+        if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
+            persistent_mode = "spec"
+            persistent_key = None
+        else:
+            persistent_mode = "decode"
+            persistent_key = self._decode_aiter_mla_metadata_key(
+                seq_lens_cpu,
+                metadata.dsa_real_num_rows,
+            )
+        self._attach_aiter_mla_persistent_metadata(
+            metadata,
+            persistent_mode,
+            persistent_key,
+        )
         self.forward_metadata = metadata
 
     def init_forward_metadata_replay_cuda_graph_from_precomputed(
@@ -1869,6 +2100,15 @@ class DeepseekSparseAttnBackend(
         self.set_dsa_prefill_impl(forward_batch=None)
 
         metadata = self.decode_cuda_graph_metadata[bs]
+        object.__setattr__(
+            metadata,
+            "dsa_real_num_rows",
+            (
+                bs * self.speculative_num_draft_tokens
+                if forward_mode.is_target_verify()
+                else bs
+            ),
+        )
 
         # Track whether fused kernel succeeded
         fused_kernel_succeeded = False
@@ -2011,6 +2251,13 @@ class DeepseekSparseAttnBackend(
             else:
                 metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
 
+        persistent_mode = (
+            "decode" if forward_mode.is_decode_or_idle() else "spec"
+        )
+        self._attach_aiter_mla_persistent_metadata(
+            metadata,
+            persistent_mode,
+        )
         self.forward_metadata = metadata
 
     def forward_extend(
@@ -2284,6 +2531,7 @@ class DeepseekSparseAttnBackend(
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
                 layer=layer,
+                metadata=metadata,
             )
         else:
             raise ValueError(
@@ -2330,13 +2578,13 @@ class DeepseekSparseAttnBackend(
         # try_014: naively re-planning mid-flight produced a GPU memory
         # fault instead of the plain shape assertion this replaces).
         padded_bs = forward_batch.batch_size
-        real_bs = padded_bs
+        real_bs = min(padded_bs, metadata.dsa_real_num_rows)
         if (
             forward_batch.forward_mode.is_decode_or_idle()
             and metadata.page_table_1 is not None
             and metadata.page_table_1.shape[0] < padded_bs
         ):
-            real_bs = metadata.page_table_1.shape[0]
+            real_bs = min(real_bs, metadata.page_table_1.shape[0])
 
         if real_bs < padded_bs:
             q = q[:real_bs]
@@ -2915,16 +3163,26 @@ class DeepseekSparseAttnBackend(
         q_scale = None
         kv_scale = None
 
-        kv_indptr = self.kv_indptr
-
-        non_minus1_mask = page_table_1 != -1
-        non_minus1_counts = non_minus1_mask.sum(dim=1)
-        kv_indptr[1 : bs + 1] = torch.cumsum(non_minus1_counts, dim=0)
+        persistent = metadata.aiter_mla_persistent
+        use_persistent = (
+            persistent is not None
+            and persistent.mode == "decode"
+            and persistent.num_rows == bs
+            and persistent.max_seqlen_q == metadata.max_seq_len_q
+        )
+        if use_persistent:
+            kv_indptr = persistent.pool.kv_indptr
+        else:
+            kv_indptr = self.kv_indptr
+            non_minus1_mask = page_table_1 != -1
+            non_minus1_counts = non_minus1_mask.sum(dim=1)
+            kv_indptr[1 : bs + 1] = torch.cumsum(non_minus1_counts, dim=0)
 
         kv_indices = self.kv_indices
         get_valid_kv_indices(page_table_1, kv_indptr, kv_indices, bs)
 
-        kv_last_page_lens = metadata.cu_seqlens_q
+        cu_seqlens_q = metadata.cu_seqlens_q[: bs + 1]
+        kv_last_page_lens = cu_seqlens_q
         mla_persistent_kwargs: Dict = {}
 
         # gfx942 has no working asm fp8 MLA kernel. For fp8 KV either take the
@@ -2937,15 +3195,9 @@ class DeepseekSparseAttnBackend(
         if kv_cache.dtype == fp8_dtype and _dsa_a8w8_ok(metadata.max_seq_len_q):
             q_kernel, q_scale = _quant_q_fp8(q_kernel)
             kv_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
-            if self._use_aiter_mla_persistent(metadata.max_seq_len_q):
-                kv_last_page_lens = self._aiter_sparse_kv_last_page_lens[:bs]
-                self._refresh_aiter_mla_persistent_metadata(
-                    metadata.cu_seqlens_q[: bs + 1],
-                    kv_indptr[: bs + 1],
-                    kv_last_page_lens,
-                    metadata.max_seq_len_q,
-                )
-                mla_persistent_kwargs = self._aiter_mla_persistent_kwargs()
+            if use_persistent:
+                kv_last_page_lens = persistent.pool.kv_last_page_lens[:bs]
+                mla_persistent_kwargs = persistent.kernel_kwargs()
         elif kv_cache.dtype == fp8_dtype:
             q_kernel = q_kernel.to(torch.bfloat16)
             kv_buffer_for_kernel, kv_indices_for_kernel = _gather_upcast_fp8_kv(
@@ -2960,8 +3212,8 @@ class DeepseekSparseAttnBackend(
             q_kernel,
             kv_buffer_for_kernel,
             o_kernel,
-            metadata.cu_seqlens_q,
-            kv_indptr,
+            cu_seqlens_q,
+            kv_indptr[: bs + 1],
             kv_indices_for_kernel,
             kv_last_page_lens,
             metadata.max_seq_len_q,
@@ -2983,8 +3235,27 @@ class DeepseekSparseAttnBackend(
         kv_cache: torch.Tensor,
         page_table_1: torch.Tensor,
         layer: RadixAttention,
+        metadata: DSAMetadata,
     ) -> torch.Tensor:
-        num_tokens = q_all.shape[0]
+        padded_num_tokens = q_all.shape[0]
+        num_tokens = min(padded_num_tokens, metadata.dsa_real_num_rows)
+        q_all = q_all[:num_tokens]
+        page_table_1 = page_table_1[:num_tokens]
+        if num_tokens == 0:
+            if self.need_pad_heads:
+                return q_all.new_zeros(
+                    (
+                        padded_num_tokens,
+                        layer.tp_q_head_num,
+                        layer.v_head_dim,
+                    )
+                )
+            return q_all.new_zeros(
+                (
+                    padded_num_tokens,
+                    layer.tp_q_head_num * layer.v_head_dim,
+                )
+            )
         q = q_all.reshape(-1, layer.tp_q_head_num * layer.head_dim)
 
         if layer.head_dim != layer.v_head_dim:
@@ -3024,16 +3295,37 @@ class DeepseekSparseAttnBackend(
                 layer.scaling,
                 out=o_kernel,
             )
+            if num_tokens < padded_num_tokens:
+                o = torch.cat(
+                    [
+                        o,
+                        o.new_zeros(
+                            padded_num_tokens - num_tokens, *o.shape[1:]
+                        ),
+                    ],
+                    dim=0,
+                )
             return o
 
         q_scale = None
         kv_scale = None
 
-        non_minus1_mask = page_table_1 != -1
-        non_minus1_counts = non_minus1_mask.sum(dim=1)
-
-        kv_indptr = torch.zeros(num_tokens + 1, dtype=torch.int32, device=self.device)
-        kv_indptr[1:] = torch.cumsum(non_minus1_counts, dim=0)
+        persistent = metadata.aiter_mla_persistent
+        use_persistent = (
+            persistent is not None
+            and persistent.mode in ("extend", "spec")
+            and persistent.num_rows == num_tokens
+            and persistent.max_seqlen_q == 1
+        )
+        if use_persistent:
+            kv_indptr = persistent.pool.kv_indptr[: num_tokens + 1]
+        else:
+            non_minus1_mask = page_table_1 != -1
+            non_minus1_counts = non_minus1_mask.sum(dim=1)
+            kv_indptr = torch.zeros(
+                num_tokens + 1, dtype=torch.int32, device=self.device
+            )
+            kv_indptr[1:] = torch.cumsum(non_minus1_counts, dim=0)
 
         # Allocate kv_indices with upper-bound size (num_tokens * topk)
         topk = page_table_1.shape[1]
@@ -3062,15 +3354,9 @@ class DeepseekSparseAttnBackend(
         if kv_cache.dtype == fp8_dtype and _dsa_a8w8_ok(1):
             q_kernel, q_scale = _quant_q_fp8(q_kernel)
             kv_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
-            if self._use_aiter_mla_persistent(1):
-                kv_last_page_lens = self._aiter_sparse_kv_last_page_lens[:num_tokens]
-                self._refresh_aiter_mla_persistent_metadata(
-                    cu_seqlens_q,
-                    kv_indptr,
-                    kv_last_page_lens,
-                    1,
-                )
-                mla_persistent_kwargs = self._aiter_mla_persistent_kwargs()
+            if use_persistent:
+                kv_last_page_lens = persistent.pool.kv_last_page_lens[:num_tokens]
+                mla_persistent_kwargs = persistent.kernel_kwargs()
         elif kv_cache.dtype == fp8_dtype:
             q_kernel = q_kernel.to(torch.bfloat16)
             _pool = kv_cache.view(-1, layer.head_dim).shape[0]
@@ -3109,6 +3395,14 @@ class DeepseekSparseAttnBackend(
         if self.need_pad_heads:
             o = o_kernel[:, :: self.head_repeat_factor, :]
 
+        if num_tokens < padded_num_tokens:
+            o = torch.cat(
+                [
+                    o,
+                    o.new_zeros(padded_num_tokens - num_tokens, *o.shape[1:]),
+                ],
+                dim=0,
+            )
         return o
 
     def _forward_trtllm(
@@ -3579,6 +3873,21 @@ class DeepseekSparseAttnMultiStepBackend:
                     precomputed.max_len,
                     precomputed.seqlens_expanded_size,
                 )
+
+                # The fused copy bypasses each backend's normal replay hook.
+                # Refresh the AITER persistent schedule once per backend so
+                # captured layers do not consume capture-time work metadata.
+                for backend, metadata in zip(
+                    self.attn_backends[:3],
+                    (metadata0, metadata1, metadata2),
+                    strict=True,
+                ):
+                    object.__setattr__(metadata, "dsa_real_num_rows", bs)
+                    backend._attach_aiter_mla_persistent_metadata(
+                        metadata,
+                        "decode",
+                    )
+                    backend.forward_metadata = metadata
 
                 # Copy remaining backends one by one (if > 3 backends)
                 for i in range(3, self.speculative_num_steps - 1):
