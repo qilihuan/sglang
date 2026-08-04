@@ -34,6 +34,7 @@ from sglang.kernels.ops.attention.utils import (
     seqlens_expand_triton,
 )
 from sglang.kernels.ops.kvcache.cache_ops import concat_and_cast_q_fp8_pad
+from sglang.kernels.ops.quantization.saturating_fp8_cast import saturating_fp8_cast
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
@@ -161,12 +162,10 @@ def _dsa_a8w8_ok(max_seqlen_q) -> bool:
     return _DSA_A8W8 and max_seqlen_q is not None and int(max_seqlen_q) <= 2
 
 
-def _quant_q_fp8(q_bf16):
-    # per-tensor symmetric fp8 quant of the absorbed latent query.
-    _fmax = torch.finfo(fp8_dtype).max
-    q_scale = (q_bf16.detach().abs().amax() / _fmax).clamp_min(1e-6).to(torch.float32)
-    q_fp8 = (q_bf16 / q_scale).clamp(-_fmax, _fmax).to(fp8_dtype)
-    return q_fp8, q_scale
+def _cast_q_fp8(q_bf16: torch.Tensor) -> torch.Tensor:
+    # Match ATOM's identity-scale Q path: no amax reduction or dynamic scaling,
+    # but saturate finite out-of-range values before conversion.
+    return saturating_fp8_cast(q_bf16, fp8_dtype=fp8_dtype)
 
 
 def _mla_decode_fwd_grouped(
@@ -2922,12 +2921,7 @@ class DeepseekSparseAttnBackend(
             # Generic fallback for non-power-of-two head counts.
             q_fp8 = concat_mla_absorb_q_general(q_nope, q_rope).to(torch.float8_e4m3fn)
 
-        # Identity per-tensor scale, cached: creating it per call is a
-        # host->device copy that synchronizes the stream.
-        identity_scale = self._q8kv8_identity_scale
-        if identity_scale is None:
-            identity_scale = torch.tensor([1.0], dtype=torch.float32, device=dev)
-            self._q8kv8_identity_scale = identity_scale
+        identity_scale = self._get_q8kv8_identity_scale(dev)
 
         # KV: append `topk` trailing zero rows so the kernel's -1-sentinel
         # clamp can map every padded topk slot to a DISTINCT zero row.
@@ -3110,6 +3104,14 @@ class DeepseekSparseAttnBackend(
             d_v=v_head_dim,
         )
 
+    def _get_q8kv8_identity_scale(self, device: torch.device) -> torch.Tensor:
+        # Keep q_scale=kv_scale=1 resident on device for all Q8KV8 paths.
+        identity_scale = self._q8kv8_identity_scale
+        if identity_scale is None:
+            identity_scale = torch.tensor([1.0], dtype=torch.float32, device=device)
+            self._q8kv8_identity_scale = identity_scale
+        return identity_scale
+
     def _forward_aiter(
         self,
         q_all: torch.Tensor,
@@ -3193,8 +3195,8 @@ class DeepseekSparseAttnBackend(
         kv_buffer_for_kernel = kv_cache.view(-1, 1, 1, layer.head_dim)
         kv_indices_for_kernel = kv_indices
         if kv_cache.dtype == fp8_dtype and _dsa_a8w8_ok(metadata.max_seq_len_q):
-            q_kernel, q_scale = _quant_q_fp8(q_kernel)
-            kv_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
+            q_kernel = _cast_q_fp8(q_kernel)
+            q_scale = kv_scale = self._get_q8kv8_identity_scale(q_kernel.device)
             if use_persistent:
                 kv_last_page_lens = persistent.pool.kv_last_page_lens[:bs]
                 mla_persistent_kwargs = persistent.kernel_kwargs()
@@ -3352,8 +3354,8 @@ class DeepseekSparseAttnBackend(
         kv_buffer_for_kernel = kv_cache.view(-1, 1, 1, layer.head_dim)
         kv_indices_for_kernel = kv_indices
         if kv_cache.dtype == fp8_dtype and _dsa_a8w8_ok(1):
-            q_kernel, q_scale = _quant_q_fp8(q_kernel)
-            kv_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
+            q_kernel = _cast_q_fp8(q_kernel)
+            q_scale = kv_scale = self._get_q8kv8_identity_scale(q_kernel.device)
             if use_persistent:
                 kv_last_page_lens = persistent.pool.kv_last_page_lens[:num_tokens]
                 mla_persistent_kwargs = persistent.kernel_kwargs()
