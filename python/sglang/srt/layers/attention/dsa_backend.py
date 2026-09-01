@@ -155,6 +155,7 @@ else:
 
 _DSA_A8W8 = get_bool_env_var("SGLANG_DSA_A8W8")
 _DSA_MLA_METADATA_DEBUG = get_bool_env_var("SGLANG_DSA_MLA_METADATA_DEBUG")
+_DSA_REAL_ROWS_DEBUG = get_bool_env_var("SGLANG_DSA_REAL_ROWS_DEBUG")
 
 
 def _dsa_a8w8_ok(max_seqlen_q) -> bool:
@@ -166,6 +167,42 @@ def _cast_q_fp8(q_bf16: torch.Tensor) -> torch.Tensor:
     # Match ATOM's identity-scale Q path: no amax reduction or dynamic scaling,
     # but saturate finite out-of-range values before conversion.
     return saturating_fp8_cast(q_bf16, fp8_dtype=fp8_dtype)
+
+
+def _get_dsa_dp_real_tokens(
+    original_counts,
+    current_counts,
+    dp_rank: int,
+    speculative_num_draft_tokens: int,
+    is_speculative: bool,
+) -> Optional[int]:
+    """Return this attention-DP rank's real rows in current forward units."""
+    if original_counts is not None and len(original_counts) > 0:
+        original_local = int(
+            original_counts[dp_rank] if len(original_counts) > 1 else original_counts[0]
+        )
+        if original_local <= 0:
+            return 0
+        if current_counts is not None and len(current_counts) > 0:
+            return max(
+                int(
+                    current_counts[dp_rank]
+                    if len(current_counts) > 1
+                    else current_counts[0]
+                ),
+                0,
+            )
+        return original_local * (
+            speculative_num_draft_tokens if is_speculative else 1
+        )
+    if current_counts is not None and len(current_counts) > 0:
+        return max(
+            int(
+                current_counts[dp_rank] if len(current_counts) > 1 else current_counts[0]
+            ),
+            0,
+        )
+    return None
 
 
 def _mla_decode_fwd_grouped(
@@ -842,6 +879,26 @@ class DeepseekSparseAttnBackend(
         computed_rows: int,
     ) -> int:
         real_tokens = getattr(forward_batch, "num_token_non_padded_cpu", None)
+        is_speculative = (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        )
+        dp_real_tokens = _get_dsa_dp_real_tokens(
+            getattr(forward_batch, "original_global_num_tokens_cpu", None),
+            getattr(forward_batch, "global_num_tokens_cpu", None),
+            get_parallel().attn_dp_rank,
+            self.speculative_num_draft_tokens,
+            is_speculative,
+        )
+        # EAGLE warmup can expose a stale zero here even though this attention-DP
+        # rank has active rows. Prefer the rank-local current-forward count in
+        # that case, while retaining a confirmed zero for genuinely idle ranks.
+        if real_tokens is None or (
+            int(real_tokens) <= 0
+            and dp_real_tokens is not None
+            and dp_real_tokens > 0
+        ):
+            real_tokens = dp_real_tokens
         if real_tokens is None:
             num_padding = getattr(forward_batch, "num_padding", None)
             if num_padding is not None:
@@ -849,25 +906,14 @@ class DeepseekSparseAttnBackend(
                     int(forward_batch.batch_size) - int(num_padding),
                     0,
                 )
-                if (
-                    forward_batch.forward_mode.is_target_verify()
-                    or forward_batch.forward_mode.is_draft_extend_v2()
-                ):
+                if is_speculative:
                     real_tokens = real_reqs * self.speculative_num_draft_tokens
                 else:
                     real_tokens = real_reqs
         if real_tokens is None:
-            counts = (
-                getattr(forward_batch, "original_global_num_tokens_cpu", None)
-                or getattr(forward_batch, "global_num_tokens_cpu", None)
-            )
-            if counts:
-                dp_rank = get_parallel().attn_dp_rank
-                real_tokens = counts[dp_rank] if len(counts) > 1 else counts[0]
-        if real_tokens is None:
             return computed_rows
         # Context-parallel extend may already have split the local Q rows.
-        return min(computed_rows, int(real_tokens))
+        return min(computed_rows, max(int(real_tokens), 0))
 
     def _attach_aiter_mla_persistent_metadata(
         self,
@@ -2577,6 +2623,11 @@ class DeepseekSparseAttnBackend(
         # try_014: naively re-planning mid-flight produced a GPU memory
         # fault instead of the plain shape assertion this replaces).
         padded_bs = forward_batch.batch_size
+        if _DSA_REAL_ROWS_DEBUG:
+            q_rows_before = q.shape[0]
+            topk_rows_before = (
+                topk_indices.shape[0] if topk_indices is not None else None
+            )
         real_bs = min(padded_bs, metadata.dsa_real_num_rows)
         if (
             forward_batch.forward_mode.is_decode_or_idle()
@@ -2602,6 +2653,51 @@ class DeepseekSparseAttnBackend(
             out_cache_loc = forward_batch.out_cache_loc
             req_pool_indices = forward_batch.req_pool_indices
             seq_lens = forward_batch.seq_lens
+
+        if _DSA_REAL_ROWS_DEBUG:
+            q_rows_after = q.shape[0]
+            topk_rows_after = (
+                topk_indices.shape[0] if topk_indices is not None else None
+            )
+            metadata_page_rows = (
+                metadata.page_table_1.shape[0]
+                if metadata.page_table_1 is not None
+                else None
+            )
+            persistent = metadata.aiter_mla_persistent
+            persistent_rows = getattr(persistent, "num_rows", None)
+            has_row_mismatch = (
+                q_rows_after != topk_rows_after
+                or q_rows_after != metadata_page_rows
+                or metadata.dsa_real_num_rows != real_bs
+                or (persistent_rows is not None and persistent_rows != real_bs)
+            )
+            if layer.layer_id == 0 or has_row_mismatch:
+                parallel = get_parallel()
+                print(
+                    "[DSA_A8W8_PD_SHAPE] "
+                    f"dp_rank={getattr(parallel, 'attn_dp_rank', 'unknown')} "
+                    f"layer_id={layer.layer_id} "
+                    f"forward_mode={forward_batch.forward_mode} "
+                    f"padded_bs={padded_bs} "
+                    f"q_rows_before={q_rows_before} q_rows_after={q_rows_after} "
+                    f"topk_rows_before={topk_rows_before} "
+                    f"topk_rows_after={topk_rows_after} "
+                    f"page_table_1_rows={metadata_page_rows} "
+                    f"metadata_dsa_real_num_rows={metadata.dsa_real_num_rows} "
+                    f"computed_real_bs={real_bs} "
+                    f"persistent_exists={persistent is not None} "
+                    f"persistent_mode={getattr(persistent, 'mode', None)} "
+                    f"persistent_num_rows={persistent_rows} "
+                    f"num_token_non_padded_cpu="
+                    f"{getattr(forward_batch, 'num_token_non_padded_cpu', None)!r} "
+                    f"num_padding={getattr(forward_batch, 'num_padding', None)!r} "
+                    f"original_global_num_tokens_cpu="
+                    f"{getattr(forward_batch, 'original_global_num_tokens_cpu', None)!r} "
+                    f"global_num_tokens_cpu="
+                    f"{getattr(forward_batch, 'global_num_tokens_cpu', None)!r}",
+                    flush=True,
+                )
 
         if self.dsa_decode_impl == "trtllm":
             # Not exercised by the current recipe (dsa_decode_backend=aiter);
