@@ -8,6 +8,16 @@
 #   docker build --build-arg SGL_BRANCH=v0.5.17 --build-arg GPU_ARCH=gfx942-rocm1000 -t v0.5.17-rocm1000-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.17 --build-arg GPU_ARCH=gfx950-rocm1000 -t v0.5.17-rocm1000-mi35x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.17 --build-arg GPU_ARCH=gfx1250-rocm1000 -t v0.5.17-rocm1000-mi45x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=main --build-arg GPU_ARCH=gfx950-rocm102 -t main-rocm10.2-nightly-mi35x -f rocm.Dockerfile .
+#
+# The rocm102 flavor tracks AMD's ROCm 10.2 nightly wheels. Move it to another
+# nightly by overriding the date and the matching torch/vision/audio/triton
+# versions published for that date, e.g.:
+#   --build-arg ROCM_NIGHTLY_VERSION=10.2.0a20261011 \
+#   --build-arg ROCM_NIGHTLY_TORCH_VERSION=2.12.0 \
+#   --build-arg ROCM_NIGHTLY_TORCHVISION_VERSION=0.27.0 \
+#   --build-arg ROCM_NIGHTLY_TORCHAUDIO_VERSION=2.11.0 \
+#   --build-arg ROCM_NIGHTLY_TRITON_VERSION=3.8.0+git669b31ac
 #
 # Flavor notes:
 #   GPU_ARCH=*-rocm724 is built on a Python 3.12 base and upgrades the stack to
@@ -19,6 +29,9 @@
 #   GPU_ARCH=gfx1250-rocm1000 carries the gfx1250 bring-up onto that same GA
 #   wheel channel. The gfx1250 workarounds key off GPU_ARCH_LIST=gfx1250 rather
 #   than the flavor name.
+#   GPU_ARCH=gfx950-rocm102 is the same pip-SDK layout as rocm1000, but takes
+#   the ROCm 10.2 SDK and its PyTorch build (torch 2.12) from AMD's nightly
+#   channel; see the rocm102-nightly-base stage.
 
 # Usage (to build SGLang ROCm + Mori docker image):
 # remove --build-arg NIC_BACKEND=ainic since new MoRI JIT will do NIC auto detection on target
@@ -49,6 +62,8 @@ ARG BASE_IMAGE_942_ROCM1000="rocm1000-base"
 ARG BASE_IMAGE_950_ROCM1000="rocm1000-base"
 ARG BASE_IMAGE_1250_ROCM1000="rocm1000-base"
 ARG BASE_IMAGE_ROCM1000="ubuntu:24.04"
+ARG BASE_IMAGE_950_ROCM102="rocm102-nightly-base"
+ARG BASE_IMAGE_ROCM102="ubuntu:24.04"
 
 # This is necessary for scope purpose
 ARG GPU_ARCH=gfx950
@@ -327,6 +342,133 @@ ENV TRITON_COMMIT_DEFAULT="76940ad348795521b3dc9f6c79acd7309ff924e3"
 ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
 RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.txt
 
+# ===============================
+# ROCm 10.2 nightly base. Same layout as rocm1000-base (pip SDK on plain
+# Ubuntu, symlinked to /opt/rocm), but from AMD's nightly channel, where the
+# SDK and the PyTorch wheels live on separate indexes. Every artifact carries
+# the nightly date in its version, so ROCM_NIGHTLY_VERSION selects a whole
+# consistent snapshot; the torch/vision/audio/triton versions must be ones the
+# PyTorch index actually published for that date.
+FROM $BASE_IMAGE_ROCM102 AS rocm102-nightly-base
+
+ARG GPU_ARCH
+
+ARG ROCM_NIGHTLY_VERSION="10.2.0a20261011"
+ARG ROCM_NIGHTLY_TORCH_VERSION="2.12.0"
+ARG ROCM_NIGHTLY_TORCHVISION_VERSION="0.27.0"
+ARG ROCM_NIGHTLY_TORCHAUDIO_VERSION="2.11.0"
+ARG ROCM_NIGHTLY_TRITON_VERSION="3.8.0+git669b31ac"
+ARG ROCM_NIGHTLY_SDK_INDEX_URL="https://nightly.repo.amd.com/rocm/whl-next/"
+ARG ROCM_NIGHTLY_PYTORCH_INDEX_URL="https://nightly.repo.amd.com/rocm/pytorch/whl-next/"
+ARG ROCM_DEVICE_ARCH_LIST="gfx942 gfx950"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        curl \
+        git \
+        gnupg \
+        libstdc++-12-dev \
+        python-is-python3 \
+        python3 \
+        python3-dev \
+        python3-pip \
+        python3.12-venv \
+        wget \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV VIRTUAL_ENV=/opt/venv
+RUN python3 -m venv "$VIRTUAL_ENV"
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+RUN python3 -m pip install --no-cache-dir -U pip setuptools setuptools_scm wheel
+
+# Two installs because the indexes are split. The PyTorch index carries only
+# the torch/triton wheels, so the second install falls back to the SDK index
+# (rocm-sdk-*, which is pinned to what the first install laid down) and then
+# PyPI for plain dependencies. PyPI cannot substitute a CUDA torch here: every
+# ROCm package is pinned to its +rocm local version.
+RUN set -eux; \
+    ROCM_DEVICE_ARCH="${GPU_ARCH%%-*}"; \
+    case " ${ROCM_DEVICE_ARCH_LIST} " in \
+      *" ${ROCM_DEVICE_ARCH} "*) ;; \
+      *) echo "Unsupported ROCm 10.2 nightly GPU_ARCH=${GPU_ARCH}"; exit 1 ;; \
+    esac; \
+    python3 -m pip install --no-cache-dir \
+        --index-url ${ROCM_NIGHTLY_SDK_INDEX_URL} \
+        "rocm-sdk-core==${ROCM_NIGHTLY_VERSION}" \
+        "rocm-sdk-libraries==${ROCM_NIGHTLY_VERSION}" \
+        "rocm-sdk-devel==${ROCM_NIGHTLY_VERSION}" \
+        "rocm-sdk-device-${ROCM_DEVICE_ARCH}==${ROCM_NIGHTLY_VERSION}"; \
+    python3 -m pip install --no-cache-dir \
+        --index-url ${ROCM_NIGHTLY_PYTORCH_INDEX_URL} \
+        --extra-index-url ${ROCM_NIGHTLY_SDK_INDEX_URL} \
+        --extra-index-url https://pypi.org/simple \
+        "rocm-sdk-core==${ROCM_NIGHTLY_VERSION}" \
+        "rocm-sdk-libraries==${ROCM_NIGHTLY_VERSION}" \
+        "torch==${ROCM_NIGHTLY_TORCH_VERSION}+rocm${ROCM_NIGHTLY_VERSION}" \
+        "torchvision==${ROCM_NIGHTLY_TORCHVISION_VERSION}+rocm${ROCM_NIGHTLY_VERSION}" \
+        "torchaudio==${ROCM_NIGHTLY_TORCHAUDIO_VERSION}+rocm${ROCM_NIGHTLY_VERSION}" \
+        "amd-torch-device-${ROCM_DEVICE_ARCH}==${ROCM_NIGHTLY_TORCH_VERSION}+rocm${ROCM_NIGHTLY_VERSION}" \
+        "amd-torchvision-device-${ROCM_DEVICE_ARCH}==${ROCM_NIGHTLY_TORCHVISION_VERSION}+rocm${ROCM_NIGHTLY_VERSION}" \
+        "triton==${ROCM_NIGHTLY_TRITON_VERSION}.rocm${ROCM_NIGHTLY_VERSION}"; \
+    for package in \
+        "rocm-sdk-device-${ROCM_DEVICE_ARCH}" \
+        "amd-torch-device-${ROCM_DEVICE_ARCH}" \
+        "amd-torchvision-device-${ROCM_DEVICE_ARCH}"; do \
+      if ! python3 -m pip show "${package}" >/dev/null 2>&1; then \
+        echo "Missing target ROCm device package: ${package}"; \
+        exit 1; \
+      fi; \
+    done; \
+    for candidate_arch in ${ROCM_DEVICE_ARCH_LIST}; do \
+      [ "${candidate_arch}" = "${ROCM_DEVICE_ARCH}" ] && continue; \
+      for package in \
+          "rocm-sdk-device-${candidate_arch}" \
+          "amd-torch-device-${candidate_arch}" \
+          "amd-torchvision-device-${candidate_arch}"; do \
+        if python3 -m pip show "${package}" >/dev/null 2>&1; then \
+          echo "Unexpected non-target ROCm device package: ${package}"; \
+          exit 1; \
+        fi; \
+      done; \
+    done; \
+    python3 -m pip list --format=freeze | grep -E '^(rocm-sdk|torch|triton|amd-torch)'
+
+RUN rocm-sdk init && rocm-sdk targets
+
+# Same duplicate-libamd_smi fix as rocm1000-base.
+RUN set -eux; \
+    SP="$VIRTUAL_ENV/lib/python3.12/site-packages"; \
+    CORE=$(ls "$SP"/_rocm_sdk_core/lib/libamd_smi.so.* 2>/dev/null | head -1); \
+    DEVEL="$SP/_rocm_sdk_devel/lib/libamd_smi.so"; \
+    if [ -n "${CORE}" ] && [ -e "${DEVEL}" ] && [ ! -L "${DEVEL}" ]; then \
+      ln -sf "${CORE}" "${DEVEL}"; \
+      echo "linked ${DEVEL} -> ${CORE}"; \
+    fi
+
+ENV ROCM_HOME=$VIRTUAL_ENV/lib/python3.12/site-packages/_rocm_sdk_devel
+ENV ROCM_PATH=$ROCM_HOME
+ENV CPATH=$ROCM_HOME/include
+ENV LIBRARY_PATH=$ROCM_HOME/lib
+ENV LD_LIBRARY_PATH=$ROCM_HOME/lib
+RUN echo 'export PATH=$ROCM_HOME/llvm/bin:$ROCM_HOME/bin:$PATH' >> /etc/bash.bashrc
+
+RUN mkdir -p /usr/lib64 && ln -sf /lib/x86_64-linux-gnu/libc.so /usr/lib64/libc.so
+
+RUN ln -s ${ROCM_HOME} /opt/rocm
+
+# ===============================
+# Base image 950 with ROCm 10.2 nightly and args (Python 3.12 + torch 2.12)
+FROM $BASE_IMAGE_950_ROCM102 AS gfx950-rocm102
+ENV BUILD_VLLM="0"
+ENV BUILD_TRITON="0"
+ENV BUILD_LLVM="0"
+ENV BUILD_AITER_ALL="1"
+ENV BUILD_MOONCAKE="1"
+ENV AITER_COMMIT_DEFAULT="e7d2453f25e5aaeea72a3a40b284ba453e026624"
+ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
+RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.txt
+
 # Local source stage: with BRANCH_TYPE=local the build context is copied here and
 # used instead of git clone (mirrors docker/Dockerfile's local_src stage).
 FROM scratch AS local_src
@@ -454,8 +596,8 @@ RUN if [ -n "$UBUNTU_MIRROR" ]; then \
 # See https://github.com/ROCm/ROCm/issues/5992
 RUN set -eux; \
     case "${GPU_ARCH}" in \
-      *rocm1000*) \
-        echo "ROCm 10.0.0 (GPU_ARCH=${GPU_ARCH}): pip SDK libdrm has the ids table built in, skipping"; \
+      *rocm1000*|*rocm102*) \
+        echo "ROCm 10.x (GPU_ARCH=${GPU_ARCH}): pip SDK libdrm has the ids table built in, skipping"; \
         ;; \
       *rocm724*) \
         echo "ROCm 7.2.4 (GPU_ARCH=${GPU_ARCH}): installing libdrm-amdgpu from graphics/7.2.4 noble"; \
@@ -500,13 +642,22 @@ RUN apt-get purge -y sccache; python -m pip uninstall -y sccache; rm -f "$(which
 # SDK pre-installs this package.
 RUN set -eux; \
     case "${GPU_ARCH}" in \
-      *rocm720*|*rocm724*|*rocm1000*) \
-        echo "ROCm 7.2 / 10.0.0 flavor detected from GPU_ARCH=${GPU_ARCH}"; \
-        cd /opt/rocm/share/amd_smi \
-        && python3 -m pip install --no-cache-dir . \
+      *rocm720*|*rocm724*|*rocm1000*|*rocm102*) \
+        echo "ROCm 7.2 / 10.x flavor detected from GPU_ARCH=${GPU_ARCH}"; \
+        cd /opt/rocm/share/amd_smi; \
+        if [ -f setup.py ] || [ -f pyproject.toml ]; then \
+          python3 -m pip install --no-cache-dir .; \
+        else \
+          # ROCm 10.2 nightly ships the bare amdsmi package with no build
+          # metadata. Expose it in place: it finds libamd_smi.so.<N> relative
+          # to its own file, so it must not be copied into site-packages.
+          python3 -c "import sysconfig; print(sysconfig.get_paths()['purelib'])" \
+            | xargs -I{} sh -c 'echo /opt/rocm/share/amd_smi > {}/amdsmi-rocm.pth'; \
+        fi; \
+        cd / && python3 -c "import amdsmi; print('amdsmi', amdsmi.__version__, amdsmi.__file__)"; \
         ;; \
       *) \
-        echo "Not rocm720/rocm724/rocm1000 (GPU_ARCH=${GPU_ARCH}), skip amdsmi installation"; \
+        echo "Not rocm720/rocm724/rocm1000/rocm102 (GPU_ARCH=${GPU_ARCH}), skip amdsmi installation"; \
         ;; \
     esac
 
@@ -528,9 +679,9 @@ RUN case "${GPU_ARCH}" in \
 # Populate the PIP_CONSTRAINT file, which only the explicitly upgraded torch
 # stages define, so resolving AITER and SGLang cannot replace the torch stack.
 # Triton is left out: on rocm724 the BUILD_TRITON step installs it later, and on
-# rocm1000 it came from the ROCm SDK alongside torch.
+# rocm1000/rocm102 it came from the ROCm SDK alongside torch.
 RUN case "${GPU_ARCH}" in \
-      *-rocm724|*-rocm1000) \
+      *-rocm724|*-rocm1000|*-rocm102) \
         python3 -m pip freeze \
           | grep -E '^(torch|torchvision|torchaudio)(==| @ )' \
           > /etc/sglang/constraints/torch-rocm.txt \
@@ -720,9 +871,15 @@ RUN pip list --format=freeze | grep -E '^(torch|triton)' > /tmp/constraints.txt
 # srt_hip pins compressed-tensors==0.15.0, which requires torch<2.11 and so
 # cannot be satisfied on the ROCm 7.2.4/1000 torch 2.11 stack. The *_rocm724
 # extras carry a 0.16.0 pin instead; all other flavors keep the extras they used before.
+# rocm102 cannot take *_rocm724 (it pins torch==2.11.0); srt_hip leaves torch and
+# compressed-tensors open, so /tmp/constraints.txt alone fixes the nightly torch.
 RUN cd sglang \
     && cp python/pyproject_other.toml python/pyproject.toml \
     && case "${GPU_ARCH}" in \
+         *-rocm102) srt_extras="srt_hip,diffusion_hip"; \
+                    all_extras="all_hip" ; \
+                    CONS="-c /tmp/constraints.txt" ; \
+                    ;; \
          *-rocm1000) srt_extras="srt_hip_rocm724,diffusion_hip"; \
                      all_extras="all_hip_rocm724" ; \
                      CONS="-c /tmp/constraints.txt" ; \
@@ -755,6 +912,7 @@ RUN python -m pip cache purge
 RUN case "${GPU_ARCH##*-}" in \
       rocm724) expected_torch="2.11."; expected_audio="2.11."; expected_vision="0.26." ;; \
       rocm1000) expected_torch="2.11."; expected_audio="2.11."; expected_vision="0.26." ;; \
+      rocm102) expected_torch="2.12."; expected_audio="2.11."; expected_vision="0.27." ;; \
       *) exit 0 ;; \
     esac \
     && python3 -m pip check \
@@ -968,7 +1126,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
     echo "${ROCM_SYSDEPS}/lib" > /etc/ld.so.conf.d/rocm-sysdeps.conf; \
     ldconfig; \
     echo "[MORI] rocm_sysdeps prefix: ${ROCM_SYSDEPS}"; \
-  elif [ "${GPU_ARCH##*-}" = "rocm1000" ] && [ -d "${ROCM_SYSDEPS}" ]; then \
+  elif { [ "${GPU_ARCH##*-}" = "rocm1000" ] || [ "${GPU_ARCH##*-}" = "rocm102" ]; } && [ -d "${ROCM_SYSDEPS}" ]; then \
     export CMAKE_PREFIX_PATH="${ROCM_SYSDEPS}${CMAKE_PREFIX_PATH:+:${CMAKE_PREFIX_PATH}}"; \
     export CPATH="${ROCM_SYSDEPS}/include${CPATH:+:${CPATH}}"; \
     export LIBRARY_PATH="${ROCM_SYSDEPS}/lib${LIBRARY_PATH:+:${LIBRARY_PATH}}"; \
@@ -1008,7 +1166,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   if [ "${GPU_ARCH_LIST}" = "gfx1250" ]; then \
     apt-get remove -y libabsl-dev libabsl20220623 || true; \
   else \
-    case "${GPU_ARCH}" in *-rocm724|*-rocm1000) apt-get remove -y libabsl-dev ;; esac; \
+    case "${GPU_ARCH}" in *-rocm724|*-rocm1000|*-rocm102) apt-get remove -y libabsl-dev ;; esac; \
   fi; \
   pip install --no-cache-dir meson ninja pybind11 meson-python patchelf pyyaml; \
   git clone --depth=1 -b "${UCX_BRANCH}" "${UCX_REPO}" /sgl-workspace/ucx; \
