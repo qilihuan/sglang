@@ -1008,7 +1008,12 @@ def _fwd_kernel_stage2(
             e_max = n_e_max
 
     if HAS_SINK:
-        cur_sink = tl.load(sink_ptr + cur_head)
+        if HAS_SINK == 2:  # IQUEST_AMD_PROBE: per-token/per-head sink logits [B, H]
+            cur_sink = tl.load(sink_ptr + cur_batch * tl.num_programs(1) + cur_head).to(
+                tl.float32
+            )
+        else:
+            cur_sink = tl.load(sink_ptr + cur_head)
         e_sum += tl.exp(cur_sink - e_max)
 
     tl.store(
@@ -1037,7 +1042,7 @@ def _decode_softmax_reducev_fwd(
     BLOCK_DV = triton.next_power_of_2(Lv)
 
     MAX_KV_SPLITS = max_kv_splits
-    HAS_SINK = sinks is not None
+    HAS_SINK = 0 if sinks is None else (2 if sinks.dim() == 2 else 1)  # IQUEST_AMD_PROBE
 
     extra_kargs = {}
     if _is_hip:
