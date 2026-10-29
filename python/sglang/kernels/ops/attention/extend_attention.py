@@ -871,7 +871,17 @@ def _fwd_kernel(
             e_max = n_e_max
 
     if HAS_SINK:
-        cur_sink = tl.load(sink_ptr + cur_head)
+        if HAS_SINK == 2:  # IQUEST_AMD_PROBE: per-token/per-head sink logits [T, H]
+            cur_sink = tl.load(
+                sink_ptr
+                + (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m)
+                * tl.num_programs(1)
+                + cur_head,
+                mask=mask_m,
+                other=0.0,
+            ).to(tl.float32)
+        else:
+            cur_sink = tl.load(sink_ptr + cur_head)
         if USE_EXP2:
             deno += tl.exp2(cur_sink * LOG2E - e_max)
         else:
@@ -1018,7 +1028,7 @@ def extend_attention_fwd(
     # Skip custom mask for prefix part
     SKIP_PREFIX_CUSTOM_MASK = skip_prefix_custom_mask
 
-    HAS_SINK = sinks is not None
+    HAS_SINK = 0 if sinks is None else (2 if sinks.dim() == 2 else 1)  # IQUEST_AMD_PROBE
     USE_FP8_PREFIX = (
         _is_gfx95
         and kimi_k3_shape
@@ -1489,7 +1499,17 @@ def _fwd_kernel_unified(
 
     # Handle sink tokens
     if HAS_SINK:
-        cur_sink = tl.load(sink_ptr + cur_head)
+        if HAS_SINK == 2:  # IQUEST_AMD_PROBE
+            cur_sink = tl.load(
+                sink_ptr
+                + (cur_seq_q_start_idx + cur_block_m * BLOCK_M + offs_m)
+                * tl.num_programs(1)
+                + cur_head,
+                mask=mask_m,
+                other=0.0,
+            ).to(tl.float32)
+        else:
+            cur_sink = tl.load(sink_ptr + cur_head)
         deno += tl.exp(cur_sink - e_max)
 
     # Store output
@@ -1574,7 +1594,7 @@ def extend_attention_fwd_unified(
     kv_group_num = q.shape[1] // kv_head_num
 
     USE_CUSTOM_MASK = custom_mask is not None
-    HAS_SINK = sinks is not None
+    HAS_SINK = 0 if sinks is None else (2 if sinks.dim() == 2 else 1)  # IQUEST_AMD_PROBE
 
     # For sliding window attention, window_start_pos tracks the absolute position
     # of the first key in each sequence's window

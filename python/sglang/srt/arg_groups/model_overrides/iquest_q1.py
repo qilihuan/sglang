@@ -16,7 +16,7 @@ def _iquest_q1_overrides(server_args: Any, hf_config: Any) -> dict:
         cfg.prefill_attention_backend,
         cfg.decode_attention_backend,
     )
-    if any(backend not in (None, "fa3") for backend in requested):
+    if any(backend not in (None, "fa3", "triton", "aiter") for backend in requested):  # IQUEST_AMD_PROBE
         raise ValueError(
             "IQuestQ1 applies its attention sink from the softmax LSE and "
             "requires FA3 attention for both prefill and decode."
@@ -24,7 +24,7 @@ def _iquest_q1_overrides(server_args: Any, hf_config: Any) -> dict:
     if cfg.speculative_algorithm is not None:
         if cfg.speculative_algorithm.upper() not in ("EAGLE", "NEXTN"):
             raise ValueError("IQuest Q1 MTP requires serial EAGLE or NEXTN drafting.")
-        if cfg.speculative_draft_attention_backend not in (None, "fa3"):
+        if cfg.speculative_draft_attention_backend not in (None, "fa3", "triton", "aiter"):  # IQUEST_AMD_PROBE
             raise ValueError("IQuestQ1 requires FA3 attention for the MTP draft.")
     if cfg.attn_cp_size > 1 or cfg.dcp_size > 1 or cfg.enable_prefill_cp:
         raise ValueError("IQuestQ1 does not support context parallelism.")
@@ -39,6 +39,8 @@ def _iquest_q1_overrides(server_args: Any, hf_config: Any) -> dict:
     if cfg.pp_size > 1:
         raise ValueError("IQuest Q1 does not support pipeline parallelism.")
     overrides = {}
+    if any(b in ("triton", "aiter") for b in requested):  # IQUEST_AMD_PROBE
+        return overrides
     if is_attention_backend_not_set(cfg):
         overrides["attention_backend"] = "fa3"
         return overrides

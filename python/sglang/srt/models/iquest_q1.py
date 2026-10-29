@@ -1,3 +1,4 @@
+import os  # IQUEST_AMD_PROBE
 import logging
 from typing import Iterable, Optional, Tuple
 
@@ -372,6 +373,7 @@ class IQuestQ1Attention(nn.Module):
             sliding_window_size=sliding_window_size,
         )
         self.enable_sink_attention = config.enable_sink_attention
+        self._probe_skip_sink = os.environ.get("IQUEST_PROBE_SKIP_SINK") == "1"  # IQUEST_AMD_PROBE
         if self.enable_sink_attention:
             self.sink_k = nn.Parameter(
                 torch.zeros(self.num_kv_heads, self.head_dim), requires_grad=False
@@ -417,7 +419,14 @@ class IQuestQ1Attention(nn.Module):
         k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(k.shape)
         if self.rotary_emb is not None:
             q, k = self.rotary_emb(positions, q, k)
-        if self.enable_sink_attention:
+        if self.enable_sink_attention and os.environ.get("IQUEST_PROBE_SINK_LOGITS") == "1":  # IQUEST_AMD_PROBE
+            qh = q.view(-1, self.num_heads, self.head_dim).float()
+            sink = self.sink_k.float().repeat_interleave(
+                self.num_heads // self.sink_k.shape[0], dim=0
+            )
+            sink_logits = ((qh * sink.unsqueeze(0)).sum(-1) * self.scaling).contiguous()
+            attn_output = self.attn(q, k, v, forward_batch, sinks=sink_logits)
+        elif self.enable_sink_attention and not self._probe_skip_sink:  # IQUEST_AMD_PROBE
             attn_output, lse = self.attn(q, k, v, forward_batch, return_lse=True)
             attn_output = self._apply_zero_value_sink(q, attn_output, lse)
         else:
