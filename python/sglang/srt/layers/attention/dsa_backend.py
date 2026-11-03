@@ -50,6 +50,14 @@ from sglang.srt.configs.model_config import (
     get_dsa_index_kpool,
 )
 from sglang.srt.environ import envs
+
+# A8W8 for the aiter DSA extend path (ported from glm5x-cp-tilelang-fp8kv
+# 2c6e696ccf): cast the absorbed query to fp8 with identity scale and
+# finite-range saturation, so aiter mla_decode_fwd selects the fp8-Q x fp8-KV
+# kernel (e.g. mla_a8w8_qh64_qseqlen1_gqaratio64 for 64 heads under prefill CP).
+import os as _os
+
+_DSA_A8W8 = _os.environ.get("SGLANG_DSA_A8W8", "0").lower() in ("1", "true")
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.dsa_backend_kpool import (
     DeepseekSparseAttnBackendKPoolMixin,
@@ -2344,6 +2352,19 @@ class DeepseekSparseAttnBackend(
                     page_table_1
                 ).to(torch.int32)
 
+        if (
+            dsa_impl == "aiter"
+            and _is_hip
+            and layer.tp_q_head_num < 16
+            and q_rope is not None
+        ):
+            # aiter asm MLA needs >= 16 q heads; its head padding and persistent
+            # metadata are sized once at init. Under prefill CP with
+            # --enable-cp-decode-attn-tp, CP extends run with all heads per rank
+            # (aiter, no padding), but non-split extends (e.g. short prompts) run
+            # in the TP layout with fewer heads: use triton for those.
+            dsa_impl = "triton"
+
         if dsa_impl == "tilelang":
             if q_rope is not None:
                 # Cat-skip, as in forward_decode: q_rope=None means the caller
@@ -3731,6 +3752,18 @@ class DeepseekSparseAttnBackend(
         else:
             q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
             o_kernel = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+
+        if (
+            _DSA_A8W8
+            and kv_cache.dtype == fp8_dtype
+            and q_kernel.dtype != fp8_dtype
+            and q_kernel.shape[1] >= 16
+        ):
+            from sglang.kernels.ops.quantization.saturating_fp8_cast import (
+                saturating_fp8_cast,
+            )
+
+            q_kernel = saturating_fp8_cast(q_kernel.contiguous(), fp8_dtype=fp8_dtype)
 
         q_scale = None
         kv_scale = None
