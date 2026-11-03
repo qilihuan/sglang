@@ -211,7 +211,8 @@ def is_dsa_enable_prefill_cp():
 
     hf_config = process_model_config().hf_config
     if is_hip():
-        return is_deepseek_v4(hf_config)
+        # GLM-5.x (GlmMoeDsaForCausalLM) DSA prefill CP is enabled on HIP too.
+        return is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)
     return is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)
 
 

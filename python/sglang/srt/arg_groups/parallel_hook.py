@@ -114,11 +114,11 @@ def handle_context_parallelism(server_args: Any):
         if (
             cfg.enable_prefill_cp
             and get_platform().is_hip
-            and model_arch != "DeepseekV4ForCausalLM"
+            and model_arch not in ("DeepseekV4ForCausalLM", "GlmMoeDsaForCausalLM")
         ):
             raise ValueError(
                 "Prefill CP on HIP is only supported for "
-                f"DeepseekV4ForCausalLM, got {model_arch!r}."
+                f"DeepseekV4ForCausalLM and GlmMoeDsaForCausalLM, got {model_arch!r}."
             )
         if (
             cfg.enable_prefill_cp

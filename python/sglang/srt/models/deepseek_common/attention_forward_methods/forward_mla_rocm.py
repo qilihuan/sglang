@@ -20,6 +20,8 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
+from sglang.srt.layers.attention.dsa_backend import prepare_kv_for_attention
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
@@ -421,7 +423,9 @@ def _fused_rope_cat_and_cache(
     )
 
 
-def _can_fuse_bmm_rope_cat_and_cache(attn: DeepseekV2AttentionMLA) -> bool:
+def _can_fuse_bmm_rope_cat_and_cache(
+    attn: DeepseekV2AttentionMLA, forward_batch: Optional[ForwardBatch] = None
+) -> bool:
     """Whether one AITER kernel can do the q absorb, the RoPE and the KV write.
 
     Those are otherwise two launches -- ``rocm_absorb_q_bmm`` in prepare and
@@ -443,7 +447,7 @@ def _can_fuse_bmm_rope_cat_and_cache(attn: DeepseekV2AttentionMLA) -> bool:
         and attn.dcp_size == 1
         and attn.w_kc.dtype == torch.float8_e4m3fn
         and attn.rotary_emb is not None
-        and attn._skip_rope_for_dsa_tilelang_fused()
+        and attn._skip_rope_for_dsa_tilelang_fused(forward_batch)
         and attn.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS
         and not attn.use_deep_gemm_bmm
         and not _SGLANG_EXPERIMENTAL_LORA_OPTI
@@ -675,7 +679,7 @@ class DeepseekMLARocmForwardMixin:
         fuse_bmm_rope_cache = (
             not q_replicate_active
             and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
-            and _can_fuse_bmm_rope_cat_and_cache(self)
+            and _can_fuse_bmm_rope_cat_and_cache(self, forward_batch)
         )
 
         if q_replicate_active:
@@ -752,7 +756,7 @@ class DeepseekMLARocmForwardMixin:
             force_rope_for_aiter_dcp_decode
             or (
                 (not fuse_rope_for_trtllm_mla)
-                and (not self._skip_rope_for_dsa_tilelang_fused())
+                and (not self._skip_rope_for_dsa_tilelang_fused(forward_batch))
                 and (not self._skip_rope_for_aiter_fused_mla())
                 and (
                     not _use_aiter
@@ -767,6 +771,17 @@ class DeepseekMLARocmForwardMixin:
             )
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+
+        # DSA prefill CP (interleave): each rank holds only its 1/C token shard.
+        # Materialize the full-sequence KV before attention, as forward_mla.py
+        # does on CUDA. No-op unless this batch runs DSA prefill CP.
+        k_nope, k_pe = prepare_kv_for_attention(
+            self,
+            forward_batch,
+            k_nope,
+            k_pe,
+            defer_materialization=fuse_rope_for_trtllm_mla,
+        )
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
         if self.dcp_size > 1:
@@ -828,7 +843,10 @@ class DeepseekMLARocmForwardMixin:
         save_kv_cache = True
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
-            if self._skip_rope_for_dsa_tilelang_fused() and self.rotary_emb is not None:
+            if (
+                self._skip_rope_for_dsa_tilelang_fused(forward_batch)
+                and self.rotary_emb is not None
+            ):
                 if q_nope_unabsorbed is not None:
                     # prepare left the absorb to us: one kernel for the BMM,
                     # the RoPE and the KV write instead of two launches that
@@ -1096,10 +1114,18 @@ class DeepseekMLARocmForwardMixin:
         else:
             return output, topk_indices
 
-    def _skip_rope_for_dsa_tilelang_fused(self: DeepseekV2AttentionMLA) -> bool:
+    def _skip_rope_for_dsa_tilelang_fused(
+        self: DeepseekV2AttentionMLA, forward_batch: Optional[ForwardBatch] = None
+    ) -> bool:
         """
         Check if we should skip rope and use fused rope+cache path for TileLang/Triton DSA on gfx95.
+
+        Not under DSA prefill CP: the fused kernel writes the KV cache with the
+        rank-local positions / out_cache_loc, but under CP the key must first be
+        all-gathered to the full sequence (prepare_kv_for_attention).
         """
+        if forward_batch is not None and dsa_use_prefill_cp(forward_batch):
+            return False
         return (
             _use_aiter_gfx95
             and self.current_attention_backend in ("dsa", "nsa")

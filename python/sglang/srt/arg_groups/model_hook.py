@@ -445,7 +445,8 @@ def handle_model_specific_adjustments(server_args: Any):
                 # TODO (Hubert): Put this back later
                 # server_args.enable_aiter_allreduce_fusion = True
 
-                if model_arch == "GlmMoeDsaForCausalLM":
+                # Aiter allreduce fusion is not supported with context parallelism.
+                if model_arch == "GlmMoeDsaForCausalLM" and not cfg.enable_prefill_cp:
                     declare_resolution(
                         server_args,
                         "_handle_model_specific_adjustments",
